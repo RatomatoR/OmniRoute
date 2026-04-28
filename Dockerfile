@@ -71,8 +71,5 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"
 
-# Install CLI tools globally with clearer failure points
-RUN npm install -g --no-audit --no-fund @openai/codex
-RUN npm install -g --no-audit --no-fund @anthropic-ai/claude-code
-RUN npm install -g --no-audit --no-fund droid
-RUN npm install -g --no-audit --no-fund openclaw@latest
+# Install CLI tools globally. Separate layer from apt for better cache reuse.
+RUN npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code droid openclaw@latest
