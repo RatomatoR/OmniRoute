@@ -106,6 +106,70 @@ function resolveAudioContentType(file: Blob & { name?: unknown }): string {
   return "application/octet-stream";
 }
 
+function parseBooleanFlag(value: FormDataEntryValue | null | undefined, defaultValue = false): boolean {
+  if (typeof value !== "string") return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
+function applyDeepgramFormattingParams(url: URL, formData?: FormData) {
+  const smartFormat = parseBooleanFlag(formData?.get("smart_format"), true);
+  const punctuate = parseBooleanFlag(formData?.get("punctuate"), true);
+  const numerals = parseBooleanFlag(formData?.get("numerals"), false);
+
+  url.searchParams.set("smart_format", smartFormat ? "true" : "false");
+  url.searchParams.set("punctuate", punctuate ? "true" : "false");
+  url.searchParams.set("numerals", numerals ? "true" : "false");
+}
+
+function normalizeDeepgramTranscriptPayload(data: any, includeTimestamps = false) {
+  const alternative = data?.results?.channels?.[0]?.alternatives?.[0] ?? {};
+  const text = typeof alternative?.transcript === "string" ? alternative.transcript : "";
+
+  const words = Array.isArray(alternative?.words)
+    ? alternative.words
+        .map((word: any) => ({
+          text: String(word?.punctuated_word ?? word?.word ?? "").trim(),
+          start: Number(word?.start ?? 0),
+          end: Number(word?.end ?? 0),
+          confidence:
+            typeof word?.confidence === "number"
+              ? Number(word.confidence)
+              : word?.confidence ?? null,
+        }))
+        .filter((word: any) => word.text.length > 0)
+    : [];
+
+  const segments = Array.isArray(alternative?.paragraphs?.paragraphs)
+    ? alternative.paragraphs.paragraphs.flatMap((paragraph: any) => {
+        const sentences = Array.isArray(paragraph?.sentences) ? paragraph.sentences : [];
+        return sentences
+          .map((sentence: any) => ({
+            text: String(sentence?.text ?? "").trim(),
+            start: Number(sentence?.start ?? 0),
+            end: Number(sentence?.end ?? 0),
+          }))
+          .filter((segment: any) => segment.text.length > 0);
+      })
+    : [];
+
+  const payload: any = {
+    text,
+    noSpeechDetected: text.length === 0,
+  };
+
+  if (includeTimestamps) {
+    payload.captions = {
+      words,
+      segments,
+    };
+  }
+
+  return payload;
+}
+
 /**
  * Handle Deepgram transcription (raw binary audio, model via query param)
  */
@@ -114,12 +178,12 @@ async function handleDeepgramTranscription(
   file,
   modelId,
   token,
-  formData?: FormData
+  formData?: FormData,
+  includeTimestamps = false
 ) {
   const url = new URL(providerConfig.baseUrl);
   url.searchParams.set("model", modelId);
-  url.searchParams.set("smart_format", "true");
-  url.searchParams.set("punctuate", "true");
+  applyDeepgramFormattingParams(url, formData);
 
   // Language: if caller specified one, use it; otherwise let Deepgram auto-detect
   const langParam = formData?.get("language");
@@ -145,15 +209,49 @@ async function handleDeepgramTranscription(
   }
 
   const data = await res.json();
-  // Transform Deepgram response to OpenAI Whisper format
-  const text = data.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? null;
+  const payload = normalizeDeepgramTranscriptPayload(data, includeTimestamps);
+  return Response.json(payload, { headers: { ...CORS_HEADERS } });
+}
 
-  // null means the audio had no recognizable speech (music, silence, etc.)
-  // Return it explicitly so the client can distinguish from a credentials error
-  return Response.json(
-    { text: text ?? "", noSpeechDetected: text === null || text === "" },
-    { headers: { ...CORS_HEADERS } }
-  );
+/**
+ * Handle Deepgram transcription from remote audio URL.
+ * Request body to Deepgram: { url: "https://..." }
+ */
+async function handleDeepgramUrlTranscription(
+  providerConfig,
+  audioUrl,
+  modelId,
+  token,
+  formData?: FormData,
+  includeTimestamps = false
+) {
+  const url = new URL(providerConfig.baseUrl);
+  url.searchParams.set("model", modelId);
+  applyDeepgramFormattingParams(url, formData);
+
+  const langParam = formData?.get("language");
+  if (typeof langParam === "string" && langParam.trim()) {
+    url.searchParams.set("language", langParam.trim());
+  } else {
+    url.searchParams.set("detect_language", "true");
+  }
+
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      ...buildAuthHeaders(providerConfig, token),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: audioUrl }),
+  });
+
+  if (!res.ok) {
+    return upstreamErrorResponse(res, await res.text());
+  }
+
+  const data = await res.json();
+  const payload = normalizeDeepgramTranscriptPayload(data, includeTimestamps);
+  return Response.json(payload, { headers: { ...CORS_HEADERS } });
 }
 
 /**
@@ -306,10 +404,10 @@ export async function handleAudioTranscription({
   }
 
   const fileEntry = formData.get("file");
-  if (!(fileEntry instanceof Blob)) {
-    return errorResponse(400, "file is required");
-  }
-  const file = fileEntry as Blob & { name?: unknown };
+  const file = fileEntry instanceof Blob ? (fileEntry as Blob & { name?: unknown }) : null;
+  const urlEntry = formData.get("url");
+  const audioUrl = typeof urlEntry === "string" && urlEntry.trim() ? urlEntry.trim() : null;
+  const includeTimestamps = parseBooleanFlag(formData.get("timestamps"), false);
 
   // Use pre-resolved provider/model from route handler if available (supports dynamic provider_nodes).
   let providerConfig = resolvedProvider;
@@ -327,6 +425,10 @@ export async function handleAudioTranscription({
     );
   }
 
+  if (typeof modelId !== "string" || !modelId.trim()) {
+    return errorResponse(400, `Invalid transcription model "${model}"`);
+  }
+
   // Skip credential check for local providers (authType: "none")
   const token =
     providerConfig.authType === "none" ? null : credentials?.apiKey || credentials?.accessToken;
@@ -336,7 +438,31 @@ export async function handleAudioTranscription({
 
   // Route to provider-specific handler
   if (providerConfig.format === "deepgram") {
-    return handleDeepgramTranscription(providerConfig, file, modelId, token, formData);
+    if (audioUrl) {
+      return handleDeepgramUrlTranscription(
+        providerConfig,
+        audioUrl,
+        modelId,
+        token,
+        formData,
+        includeTimestamps
+      );
+    }
+    if (!file) {
+      return errorResponse(400, "file or url is required");
+    }
+    return handleDeepgramTranscription(
+      providerConfig,
+      file,
+      modelId,
+      token,
+      formData,
+      includeTimestamps
+    );
+  }
+
+  if (!file) {
+    return errorResponse(400, "file is required");
   }
 
   if (providerConfig.format === "assemblyai") {
