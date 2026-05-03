@@ -220,9 +220,11 @@ export class BaseExecutor {
   buildHeaders(
     credentials: ProviderCredentials,
     stream = true,
-    clientHeaders?: Record<string, string> | null
+    clientHeaders?: Record<string, string> | null,
+    model?: string
   ): Record<string, string> {
     void clientHeaders;
+    void model;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...this.config.headers,
@@ -274,11 +276,18 @@ export class BaseExecutor {
       const cloned = { ...body } as Record<string, unknown>;
 
       if (Array.isArray(cloned.tools)) {
-        cloned.tools = cloned.tools.map((tool: any) => {
-          if (tool?.function && typeof tool.function === "object") {
-            const func = { ...tool.function };
-            if (func.description === "") delete func.description;
-            return { ...tool, function: func };
+        cloned.tools = cloned.tools.map((tool: unknown) => {
+          if (tool && typeof tool === "object" && !Array.isArray(tool)) {
+            const toolRecord = tool as JsonRecord;
+            const toolFunction = toolRecord.function;
+            if (toolFunction && typeof toolFunction === "object" && !Array.isArray(toolFunction)) {
+              const func = { ...(toolFunction as JsonRecord) };
+              if (func.description === "") delete func.description;
+              if (typeof func.name !== "string" || func.name.trim() === "") {
+                func.name = "unnamed_tool";
+              }
+              return { ...toolRecord, function: func };
+            }
           }
           return tool;
         });
@@ -435,7 +444,7 @@ export class BaseExecutor {
 
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
       const url = this.buildUrl(model, stream, urlIndex, activeCredentials);
-      const headers = this.buildHeaders(activeCredentials, stream, clientHeaders);
+      const headers = this.buildHeaders(activeCredentials, stream, clientHeaders, model);
       applyConfiguredUserAgent(headers, activeCredentials?.providerSpecificData);
 
       const ccRequestDefaults = isClaudeCodeCompatible(this.provider)
