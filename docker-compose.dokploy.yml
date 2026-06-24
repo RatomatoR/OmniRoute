@@ -123,7 +123,7 @@ services:
   # ── Profile: cliproxyapi (CLIProxyAPI as sidecar) ─────────────────
   cliproxyapi:
     container_name: cliproxyapi
-    image: ghcr.io/router-for-me/cliproxyapi:v6.9.7
+    image: eceasy/cli-proxy-api:latest
     restart: unless-stopped
     # ports:
     #   - "${CLIPROXYAPI_PORT:-8317}:${CLIPROXYAPI_PORT:-8317}"
@@ -140,6 +140,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    entrypoint: >
+      /bin/sh -c "
+      if [ ! -f /CLIProxyAPI/config.yaml ]; then
+        echo 'host: \"0.0.0.0\"' > /CLIProxyAPI/config.yaml;
+        echo 'port: 8317' >> /CLIProxyAPI/config.yaml;
+        echo 'auth-dir: \"/root/.cli-proxy-api\"' >> /CLIProxyAPI/config.yaml;
+      fi;
+      exec /CLIProxyAPI/CLIProxyAPI
+      "
     networks:
       - dokploy-network
       - default
